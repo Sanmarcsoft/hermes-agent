@@ -1842,14 +1842,22 @@ class MatrixAdapter(BasePlatformAdapter):
     async def _sync_loop(self) -> None:
         client = self._client
         next_batch = await client.sync_store.get_next_batch()  # resume from the initial sync
+        syncs = 0
+        last_beat = time.time()
         while not self._closing:
             try:
                 # 45s outer cap guards TCP-level hangs the 30s long-poll timeout cannot catch.
                 # mautrix raises on every non-2xx, so a non-dict here is never an error object.
                 sync_data = await asyncio.wait_for(client.sync(since=next_batch, timeout=30000), timeout=45.0)
+                syncs += 1
                 if isinstance(sync_data, dict):
                     next_batch = await self._absorb_sync(client, sync_data) or next_batch
                     await asyncio.sleep(0)  # let fresh invite joins start before the next sync
+                # A silent adapter and a dead one look the same from outside; this line, every
+                # five minutes, is how an operator tells them apart in the log.
+                if time.time() - last_beat >= 300:
+                    last_beat = time.time()
+                    logger.info("Matrix: sync alive (%d syncs since start, joined %d rooms)", syncs, len(self._joined_rooms))
             except asyncio.CancelledError:
                 return
             except Exception as exc:
