@@ -1895,6 +1895,12 @@ class BasePlatformAdapter(ABC):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        # When each owner task started (monotonic seconds), so a turn that never ends can be
+        # recognised as stale and healed instead of silently queuing every later message.
+        self._session_task_started: Dict[str, float] = {}
+        # A single turn longer than this is treated as hung: the owner task is cancelled and the
+        # guard released. Fifteen minutes is far past any legitimate turn on the local model.
+        self._busy_turn_max_seconds: float = float(os.environ.get("HERMES_BUSY_TURN_MAX_SECONDS", "900") or 900)
         # Busy-text policy is a per-profile config decision the runner installs after construction
         # (``_wire_adapter_handlers``); a constructor-time process-env read would freeze the launch
         # profile's values into every profile's adapter under multiplexing (#116893). Defaults here
@@ -3780,22 +3786,52 @@ class BasePlatformAdapter(ABC):
             return
         del self._active_sessions[session_key]
 
+    def _session_task_age(self, session_key: str) -> Optional[float]:
+        """Seconds since the owner task for ``session_key`` started, or None when unknown."""
+        started = getattr(self, "_session_task_started", {}).get(session_key)
+        return None if started is None else max(0.0, time.monotonic() - started)
+
+    def _session_task_is_overdue(self, session_key: str) -> bool:
+        """True when the owner task is still alive but has run past the busy-turn ceiling."""
+        task = self._session_tasks.get(session_key)
+        done = getattr(task, "done", None)
+        if task is None or (done and done()):
+            return False
+        age = self._session_task_age(session_key)
+        limit = getattr(self, "_busy_turn_max_seconds", 900.0)
+        return age is not None and limit > 0 and age > limit
+
     def _session_task_is_stale(self, session_key: str) -> bool:
-        """True if the recorded owner task for ``session_key`` has exited. No owner task at all is
-        NOT stale (guards installed outside handle_message, as tests do, must not be healed)."""
+        """True if the recorded owner task for ``session_key`` has exited, or has run past the
+        busy-turn ceiling (a hung turn keeps the guard and silently queues every later message).
+        No owner task at all is NOT stale (guards installed outside handle_message, as tests do,
+        must not be healed)."""
         done = getattr(self._session_tasks.get(session_key), "done", None)
-        return bool(done and done())
+        return bool(done and done()) or self._session_task_is_overdue(session_key)
 
     def _heal_stale_session_lock(self, session_key: str) -> bool:
         """Clear a stale session lock; True if healed. On-entry safety net: without it a split-brain
         (guard held, nothing processing) traps the chat in "Interrupting..." until restart."""
         if session_key not in self._active_sessions or not self._session_task_is_stale(session_key):
             return False
-        logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
-                       self.name, session_key)
+        if self._session_task_is_overdue(session_key):
+            task = self._session_tasks.get(session_key)
+            age = self._session_task_age(session_key)
+            logger.warning("[%s] Healing hung session %s: owner task alive for %.0fs, past the %.0fs ceiling; cancelling it",
+                           self.name, session_key, age or 0.0, getattr(self, "_busy_turn_max_seconds", 900.0))
+            try:
+                if task is not None and hasattr(task, "cancel"):
+                    self._expected_cancelled_tasks.add(task)
+                    task.cancel()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[%s] Cancel of hung owner task failed: %s", self.name, exc)
+        else:
+            logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
+                           self.name, session_key)
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
+        getattr(self, "_session_task_started", {}).pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
 
@@ -3806,6 +3842,9 @@ class BasePlatformAdapter(ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
+        if not hasattr(self, "_session_task_started"):
+            self._session_task_started = {}
+        self._session_task_started[session_key] = time.monotonic()
         task = asyncio.create_task(self._process_message_background(event, session_key))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
@@ -3997,6 +4036,10 @@ class BasePlatformAdapter(ABC):
                          session_key, self._busy_text_debounce_seconds)
             await self._queue_text_debounce(session_key, event)
         else:
+            age = self._session_task_age(session_key)
+            logger.info("[%s] Message queued behind an active turn for %s (owner task running %s s); "
+                        "it runs when that turn ends", self.name, session_key,
+                        "?" if age is None else f"{age:.0f}")
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
             merge_pending_message_event(self._pending_messages, session_key, event,
